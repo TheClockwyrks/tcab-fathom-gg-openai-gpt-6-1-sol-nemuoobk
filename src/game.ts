@@ -1,114 +1,179 @@
-// Fathom — the game. THIS IS THE FILE YOU IMPLEMENT.
-//
-// `src/main.ts`, `src/constants.ts` and the project's configuration are supplied
-// with the project and stay as they are. What is missing is the game: the state it
-// holds, the debug surface that poses and reads that state, and the three
-// functions below.
-//
-// FIRST, DECLARE AND EXPORT `FathomState`, exactly as `specs/state.md` fixes it,
-// and `FathomDebugApi`, the debug and automation surface `specs/instrumentation.md`
-// specifies. The stub below is written against both names, so this project does
-// not compile until they exist — the type check failing on a freshly seeded
-// workspace is the starting point, not a broken seed.
-//
-// THEN IMPLEMENT the three functions. `initialize` runs once, when the engine is
-// initialized, and returns the state and the debug surface together, as the pair
-// `[state, debug]`. `update` and `render` then run once each per frame — `update`
-// first, with the frame's delta time in SECONDS, then `render`.
-//
-// The state is a VALUE, and every frame is a transition over it. The engine hands
-// `update` the current state as a read-only view (`DeepReadonly<FathomState>`)
-// and stores whatever `update` returns as the next state; `render` is handed
-// that next state, as the same read-only view, and returns nothing. Nothing ever
-// holds a writable `FathomState`: `update` builds the next state from the current
-// one (spread the parts that change, `map` over the arrays) rather than assigning
-// into it, and a frame that returns `undefined` is refused by the engine. The
-// engine's own documentation, seeded at `engine/`, defines all of this and the
-// scoped APIs each function receives; read it before you start.
-//
-// The engine returns the surface from `engine.debug`, exactly as `initialize`
-// handed it over, which is how the game is driven from code
-// (`specs/instrumentation.md`). Because no one holds a writable state, the
-// surface is written in the shape of `update`: a pose takes the current state and
-// returns the next (`setMaze(state, rows)`), a reading takes the state and
-// returns what it read (`snapshot(state)`), and a caller drives them through
-// `engine.apply` and `engine.state`. Where its implementation lives under `src/`
-// is your call; the only fixed point is that `initialize` returns it.
-//
-// The ART comes from the engine as well. The frames under `assets/` are loaded
-// through the engine's asset loader, which resolves a path under the `assets/`
-// root and against the page the build is served from — the engine's asset
-// documentation, seeded at `engine/`, defines the API, and `specs/assets.md`
-// states what each sheet holds and how a frame is drawn.
-
-import type {
-  Game,
-  InitApi,
-  RenderApi,
-  UpdateApi,
-} from "@clockwyrks/simple-2d";
-import type { DeepReadonly } from "ts-essentials";
-
-/**
- * The stage background, a CSS color string. `src/main.ts` hands it to the engine
- * as the color the canvas is cleared to each frame, so the letterbox bars around
- * the stage match the water itself. This placeholder is replaced by the build
- * with the color its trench uses.
- */
-export const BACKGROUND = "#000";
-
-const NOT_IMPLEMENTED = "Fathom: src/game.ts is not implemented yet";
-
-/**
- * The game this build's engine drives.
- *
- * Implement all three functions. Nothing else in the project needs changing for
- * the game to run: `src/main.ts` already binds this object to the engine.
- */
+import type { Game } from "@clockwyrks/simple-2d";
+import * as C from "./constants";
+import {
+  fresh,
+  clone,
+  enter,
+  menu,
+  rect,
+  reconcile,
+  directions,
+  type FathomState,
+} from "./model";
+import { debug, type FathomDebugApi } from "./debug";
+import { tick } from "./simulation";
+import { render, BACKGROUND } from "./render";
+export { BACKGROUND };
+export type {
+  FathomState,
+  Dir,
+  Screen,
+  Body,
+  Drifter,
+  Predator,
+  PredatorKind,
+  Pulse,
+} from "./model";
+export type { FathomDebugApi } from "./debug";
+function restart(s: FathomState, title = false) {
+  const n = fresh(s.assets, s.muted);
+  n.titleIndex = s.titleIndex;
+  n.simTime = s.simTime;
+  n.remainder = s.remainder;
+  Object.assign(s, n);
+  enter(s, title ? "title" : "countdown");
+}
+function confirm(s: FathomState) {
+  if (s.screen === "title") {
+    s.titleIndex = s.menuIndex ?? 0;
+    if (s.menuIndex === 1) enter(s, "howto");
+    else restart(s);
+  } else if (s.screen === "paused") {
+    if (s.menuIndex === 0) enter(s, "playing");
+    else restart(s, s.menuIndex === 2);
+  } else if (s.screen === "gameover") restart(s, s.menuIndex === 1);
+}
 export const game: Game<FathomState, FathomDebugApi> = {
-  /**
-   * Runs once, before any frame.
-   *
-   * Register every action in ACTIONS against its BINDINGS, define the seven CUES,
-   * load the frames of the sheets specs/assets.md lists, register the diagnostic
-   * sources specs/instrumentation.md lists — each is handed the state current at
-   * the read, so none closes over the state built here — and build the complete
-   * initial state: the title screen, with every field of FathomState set. Return
-   * it beside the debug surface.
-   */
-  initialize(_api: InitApi<FathomState>): [FathomState, FathomDebugApi] {
-    throw new Error(NOT_IMPLEMENTED);
+  async initialize(api) {
+    for (const action of C.ACTIONS)
+      api.input.register(action, { keys: [...C.BINDINGS[action]] });
+    Object.values(C.CUES).forEach((name, i) =>
+      api.audio.define(name, {
+        wave: i === 2 ? "triangle" : "sine",
+        freq: [740, 920, 120, 330, 180, 240, 400][i],
+        freqTo: [1100, 160, 45, 660, 1800, 50, 1000][i],
+        gain: 0.12,
+        durationMs: [65, 420, 300, 250, 500, 550, 650][i],
+      }),
+    );
+    const assets: Record<string, ImageBitmap[]> = {};
+    await Promise.all(
+      [
+        ["glimmerfin", 8],
+        ["lanternjaw", 16],
+        ["gloamfin", 8],
+        ["flarefish", 8],
+        ["drifter", 8],
+        ["flare-bloom", 8],
+        ["trench-walls", 19],
+      ].map(async ([name, count]) => {
+        const key = String(name);
+        assets[key] = await Promise.all(
+          Array.from({ length: Number(count) }, (_, i) =>
+            api.assets.loadImage(`${key}/${i}.png`),
+          ),
+        );
+      }),
+    );
+    for (const name of [
+      "screen",
+      "depth",
+      "score",
+      "lives",
+      "brightness",
+      "visionRadius",
+      "windowRadius",
+      "planktonRemaining",
+    ] as const)
+      api.diagnostics.register(name, (s) => s[name]);
+    api.diagnostics.register(
+      "cooldowns",
+      (s) =>
+        `sonar ${s.sonar.cooldown.toFixed(2)} / ink ${s.ink.cooldown.toFixed(2)}`,
+    );
+    api.diagnostics.register(
+      "forager",
+      (s) => `${s.forager.tx},${s.forager.ty} ${s.forager.dir}`,
+    );
+    for (let i = 0; i < C.DEN_ORDER.length * C.ROSTER_CAP; i++)
+      api.diagnostics.register(`hunter ${i}`, (s) => {
+        const p = s.predators[i];
+        return p
+          ? `${p.kind} ${p.state} ${p.tx},${p.ty} ${p.speed.toFixed(0)} alert:${p.alert}`
+          : "none";
+      });
+    return [fresh(assets), debug];
   },
-
-  /**
-   * Runs once per frame, before `render`: the next state, from the current one.
-   *
-   * `dt` is the real elapsed SECONDS of this frame, and specs/movement.md fixes
-   * the simulation at TICK_HZ steps of TICK_DT each, so a frame advances the
-   * whole ticks its delta completes and carries the remainder into the next one.
-   * `simTime` accumulates the time those ticks cover, on every screen. Read
-   * input, advance the simulation, play cues, and mirror the engine's mute bit
-   * into the returned state's `muted`. The value returned is what `render` draws
-   * and what the next `update` receives; `state` itself is read-only and stays as
-   * it was.
-   */
-  update(
-    _state: DeepReadonly<FathomState>,
-    _api: UpdateApi,
-    _dt: number,
-  ): FathomState {
-    throw new Error(NOT_IMPLEMENTED);
+  update(state, api, dt) {
+    const s = clone(state),
+      input = api.input;
+    if (input.pressed("mute")) api.audio.setMuted(!api.audio.muted());
+    s.muted = api.audio.muted();
+    let accept = false;
+    const samples = input.pointerSamples();
+    for (const sample of samples) {
+      const hit = menu(s).findIndex((_, i) => {
+        const r = rect(s, i);
+        return (
+          r !== null &&
+          sample.x >= r.x &&
+          sample.x <= r.x + r.w &&
+          sample.y >= r.y &&
+          sample.y <= r.y + r.h
+        );
+      });
+      if (hit >= 0 && (sample.type === "move" || sample.type === "down"))
+        s.menuIndex = hit;
+      if (sample.type === "down")
+        s.pointerStarts[sample.id] = s.screen === "howto" ? -2 : hit;
+      if (sample.type === "up") {
+        const start = s.pointerStarts[sample.id];
+        if (
+          start !== undefined &&
+          ((hit >= 0 && start === hit) ||
+            (s.screen === "howto" && start === -2))
+        ) {
+          if (hit >= 0) s.menuIndex = hit;
+          accept = true;
+        }
+        delete s.pointerStarts[sample.id];
+      }
+    }
+    const screen = s.screen;
+    if (screen === "playing" && input.pressed("pause")) enter(s, "paused");
+    else if (
+      screen === "paused" &&
+      (input.pressed("pause") || input.pressed("back"))
+    )
+      enter(s, "playing");
+    else if (screen === "howto") {
+      if (input.pressed("confirm") || input.pressed("back") || accept)
+        restart(s, true);
+    } else if (menu(s).length) {
+      const count = menu(s).length;
+      if (input.pressed("up"))
+        s.menuIndex = ((s.menuIndex ?? 0) + count - 1) % count;
+      if (input.pressed("down")) s.menuIndex = ((s.menuIndex ?? 0) + 1) % count;
+      if (screen === "gameover" && input.pressed("back")) restart(s, true);
+      else if (input.pressed("confirm") || accept) confirm(s);
+    }
+    if (screen === "playing" && s.screen === "playing") {
+      if (input.pressed("a")) s.pending.push("sonar");
+      if (input.pressed("b")) s.pending.push("ink");
+    }
+    const held = directions.filter((d) => input.value(d) > 0);
+    s.remainder += dt;
+    while (s.remainder + 1e-10 >= C.TICK_DT) {
+      s.remainder -= C.TICK_DT;
+      const cues = tick(s, {
+        held,
+        sonar: s.pending.includes("sonar"),
+        ink: s.pending.includes("ink"),
+      });
+      s.pending = [];
+      for (const cue of cues) api.audio.play(cue);
+    }
+    return reconcile(s);
   },
-
-  /**
-   * Runs once per frame, after `update`, with the state `update` returned.
-   *
-   * `api.ctx` arrives cleared and already carrying the logical transform, so draw
-   * in 1280x720 coordinates and never read the canvas element's size. The state
-   * arrives read-only, so the type is what guarantees that rendering changes
-   * nothing.
-   */
-  render(_state: DeepReadonly<FathomState>, _api: RenderApi): void {
-    throw new Error(NOT_IMPLEMENTED);
-  },
+  render,
 };
